@@ -388,119 +388,144 @@ class LoiterActionFloatSam():
         return
 
     def _loop_inner(self) -> bool | None:
-        '''
-        Main loiter loop
-        '''
+        """
+        Main loiter loop. Returns True/False to terminate, None to continue.
 
+        Explicit states:
+          OUTSIDE_IDLE    - beyond tolerance, no active move_to → trigger one
+          OUTSIDE_PENDING - beyond tolerance, move_to in flight → wait
+          RETURNING       - within tolerance but move_to still finishing → poll result
+          HOLDING         -within tolerance, no active move_to → publish setpoints
+        """
         if self._loiter_center_in_map is None:
-            self._node.get_logger().error('No loiter center set, failing...')
-            if self._saved_background_parameters:
-                self._write_captain_parameters(self._saved_background_parameters)
+            self._node.get_logger().error('No loiter center set, failing...', throttle_duration_sec=1.0)
+            self._restore_captain_parameters()
             return False
 
         if self._floatsam.floatsam_in_map is None:
-            self._node.get_logger().info('No floatsam position available yet, waiting...')
+            self._node.get_logger().info('No floatsam position available yet, waiting...', throttle_duration_sec=1.0)
             return None
-        
-        elapsed_time = self.now_time - self._start_time
-        time_remaining = self._timeout - elapsed_time            
-        
-        if elapsed_time >= self._timeout:
-            if self._move_to_goal_handle is not None:
-                self._node.get_logger().info('Cancelling active move_to goal...')
-                cancel_future = self._move_to_goal_handle.cancel_goal_async()
-                self._move_to_goal_handle = None
-                self._move_to_pending = False
-            if self._heading_reached and self._position_reached:
-                self._node.get_logger().info(f'Loiter timeout reached ({self._timeout}s) and within tolerance - completing successfully')
-                if self._saved_background_parameters:
-                    self._write_captain_parameters(self._saved_background_parameters)
-                return True  
-            else:
-                self._node.get_logger().warning(f'Loiter timeout reached ({self._timeout}s) but NOT within tolerance (distance={self._distance_from_center:.2f}m, tolerance={self._loiter_tolerance}m) - failing')
-                if self._saved_background_parameters:
-                    self._write_captain_parameters(self._saved_background_parameters)
-                return False  
-        
-        center_position = np.array([
+
+        # --- Compute state inputs first so timeout can use them in its log ---
+        self._update_distance_and_heading()
+
+        elapsed = self.now_time - self._start_time
+        time_remaining = self._timeout - elapsed
+
+        if elapsed >= self._timeout:
+            return self._handle_timeout()
+
+        self._log_status(time_remaining)
+
+        # --- Explicit state dispatch ---
+        outside = self._distance_from_center > self._loiter_tolerance
+
+        if outside and not self._move_to_pending:
+            # OUTSIDE_IDLE: drift detected, kick off a reposition
+            self._node.get_logger().warning(
+                f'Outside loiter tolerance ({self._distance_from_center:.2f}m > '
+                f'{self._loiter_tolerance}m), triggering move_to...', throttle_duration_sec=1.0
+            )
+            self._move_to_pending = True
+            self._trigger_move_to_center()
+            return None
+
+        if outside and self._move_to_pending:
+            # OUTSIDE_PENDING: reposition in flight, just wait
+            self._node.get_logger().info('Reposition pending, waiting...', throttle_duration_sec=1.0)
+            return None
+
+        if self._move_to_goal_handle is not None or self._move_to_pending:
+            # RETURNING: we're back inside tolerance but move_to hasn't finished yet
+            self._node.get_logger().info('INSIDE but Reposition pending, waiting...', throttle_duration_sec=1.0)
+            return self._poll_move_to_result()
+
+        # HOLDING: inside tolerance, no active move_to
+        #self._node.get_logger().info('Within loiter tolerance, maintaining position', throttle_duration_sec=1.0)
+        self._node.get_logger().info('I am inside an nothing is pending', throttle_duration_sec=1.0)
+        self._publish_setpoints()
+        return None
+    
+    def _update_distance_and_heading(self) -> None:
+        """Recompute distance from loiter centre and heading error; update flags."""
+        center = np.array([
             self._loiter_center_in_map.pose.position.x,
-            self._loiter_center_in_map.pose.position.y
+            self._loiter_center_in_map.pose.position.y,
         ])
-        
-        current_position = np.array([
+        current = np.array([
             self._floatsam.floatsam_in_map.pose.position.x,
-            self._floatsam.floatsam_in_map.pose.position.y
+            self._floatsam.floatsam_in_map.pose.position.y,
         ])
-        
-        error_vector = center_position - current_position
-        self._distance_from_center = float(np.linalg.norm(error_vector))
-        
+        self._distance_from_center = float(np.linalg.norm(center - current))
+
         orientation = self._floatsam.floatsam_in_map.pose.orientation
-        _, _, current_yaw = euler_from_quaternion([
+        _, _, yaw = euler_from_quaternion([
             orientation.x, orientation.y, orientation.z, orientation.w
         ])
-        
-        heading_error_rad = self.heading - current_yaw
-        heading_error_rad = np.arctan2(np.sin(heading_error_rad), np.cos(heading_error_rad))
-        self._current_heading_error = np.degrees(abs(heading_error_rad))  # Convert to degrees
-        
-        if self._distance_from_center <= self._loiter_tolerance:
-            self._position_reached = 1
-        else:
-            self._position_reached = 0
-        if self._current_heading_error <= self._heading_tolerance:
-            self._heading_reached = 1
-        else:
-            self._heading_reached = 0
-        
-        self._node.get_logger().info(
-            f'Loitering: time remaining={time_remaining:.1f}s, '
-            f'distance from center: {self._distance_from_center:.2f}m '
-            f'(tolerance: {self._loiter_tolerance}m), '
-            f'heading error: {self._current_heading_error:.1f}° '
-            f'(tolerance: {self._heading_tolerance}°), '
-            f'position_reached: {self._position_reached}, heading_reached: {self._heading_reached}'
+        error_rad = np.arctan2(
+            np.sin(self.heading - yaw),
+            np.cos(self.heading - yaw)
         )
-        
-        if self._distance_from_center > self._loiter_tolerance and not self._move_to_pending:
+        self._current_heading_error = float(np.degrees(abs(error_rad)))
 
-            self._node.get_logger().warning(f'Outside loiter tolerance! Triggering move_to to return to center...')
-            self._move_to_pending=True
-            self._trigger_move_to_center()
-            self._last_reposition_trigger = self.now_time
-        
+        self._position_reached = int(self._distance_from_center <= self._loiter_tolerance)
+        self._heading_reached  = int(self._current_heading_error <= self._heading_tolerance)
+
+    def _handle_timeout(self) -> bool:
+        """Cancel any in-flight move_to and return success/failure based on tolerance."""
+        if self._move_to_goal_handle is not None:
+            self._move_to_goal_handle.cancel_goal_async()
+            self._move_to_goal_handle = None
+            self._move_to_pending = False
+
+        self._restore_captain_parameters()
+
+        if self._heading_reached and self._position_reached:
+            self._node.get_logger().info(
+                f'Loiter timeout ({self._timeout}s) reached within tolerance — success'
+            )
+            return True
+
+        self._node.get_logger().warning(
+            f'Loiter timeout ({self._timeout}s) reached outside tolerance '
+            f'(distance={self._distance_from_center:.2f}m, '
+            f'heading_error={self._current_heading_error:.1f}°) — failing'
+        )
+        return False
+
+    def _poll_move_to_result(self) -> None:
+        """Check whether the active move_to future has resolved; clear state when done."""
+        if self._move_to_result_future is None or not self._move_to_result_future.done():
+            self._node.get_logger().debug('move_to in flight, waiting...')
             return None
-        
-        else:
-            self._node.get_logger().info('self.move_to_goal_handle: ' + str(self._move_to_goal_handle) + 'self._move_to_pending: ' + str(self._move_to_pending))
-    
-            if self._move_to_goal_handle is not None or self._move_to_pending:
-                
-                if self._move_to_result_future is not None and self._move_to_result_future.done():
-                    try:
-                        result = self._move_to_result_future.result()
-                        if result.result.success:
-                            self._node.get_logger().info('move_to completed successfully - returned to center')
-                        else:
-                            self._node.get_logger().warning('move_to failed - will retry on next loop')
-                        
-                        self._move_to_goal_handle = None
-                        self._move_to_result_future = None
-                        self._move_to_pending = False  
 
-                    except Exception as e:
-                        self._node.get_logger().error(f'Error getting move_to result: {e}')
-                        self._move_to_goal_handle = None
-                        self._move_to_result_future = None
-                else:
-                    self._node.get_logger().debug('move_to action active/pending, waiting...')
-                    return None
-                
+        try:
+            result = self._move_to_result_future.result()
+            if result.result.success:
+                self._node.get_logger().info('move_to completed — returned to centre')
             else:
-                self._node.get_logger().info('Within loiter tolerance, maintaining position')
-                self._publish_setpoints()
-            
-            return None
+                self._node.get_logger().warning('move_to failed — will retry next tick')
+        except Exception as e:
+            self._node.get_logger().error(f'Error reading move_to result: {e}')
+        finally:
+            self._move_to_goal_handle = None
+            self._move_to_result_future = None
+            self._move_to_pending = False
+
+        return None
+
+    def _log_status(self, time_remaining: float) -> None:
+        self._node.get_logger().info(
+            f'Loitering: time_remaining={time_remaining:.1f}s, '
+            f'distance={self._distance_from_center:.2f}m (tol={self._loiter_tolerance}m), '
+            f'heading_error={self._current_heading_error:.1f}° (tol={self._heading_tolerance}°), '
+            f'pos_ok={self._position_reached}, hdg_ok={self._heading_reached}', throttle_duration_sec=1.0
+        )
+
+    def _restore_captain_parameters(self) -> None:
+        """Convenience wrapper so callers don't repeat the None check."""
+        if self._saved_background_parameters:
+            self._write_captain_parameters(self._saved_background_parameters)
 
     def _trigger_move_to_center(self):
         '''Send move_to goal to return to loiter center and track the goal handle.'''
