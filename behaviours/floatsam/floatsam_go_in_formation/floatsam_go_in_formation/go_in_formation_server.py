@@ -15,7 +15,7 @@ from floatsam_go_in_formation.PathParameterizer import PathParameterizer
 import time
 import traceback
 
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32
 from geographic_msgs.msg import GeoPoint
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped
@@ -38,6 +38,11 @@ class FloatsamGoInFormationAction():
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
             history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        self._best_effort_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
 
@@ -82,6 +87,8 @@ class FloatsamGoInFormationAction():
         self._node.declare_parameter('carrot_speed', 1.0, double_desc)
         self._node.declare_parameter('move_to_trigger', 2.0, double_desc)
         self._node.declare_parameter('catch_up_gain', 1.0, double_desc)
+        self._node.declare_parameter('catch_up_distance', 1.0, double_desc)
+        self._node.declare_parameter('look_a_head_distance', 3.0, double_desc)
 
 
         self._node.declare_parameter("yaw_p_gain", 0.6, double_desc)
@@ -105,11 +112,16 @@ class FloatsamGoInFormationAction():
         self._carrot_speed = self._node.get_parameter('carrot_speed').get_parameter_value().double_value
         self._move_to_trigger = self._node.get_parameter('move_to_trigger').get_parameter_value().double_value
         self._catch_up_gain = self._node.get_parameter('catch_up_gain').get_parameter_value().double_value
+        self._catch_up_distance = self._node.get_parameter('catch_up_distance').get_parameter_value().double_value
+        self._look_a_head_distance = self._node.get_parameter('look_a_head_distance').get_parameter_value().double_value
+
+        
 
         self._robot_ids        = range(self._num_robots)
         self._robot_base_name  = '_'.join(self._this_robot_name.split('_')[:-1])
         self._others_arrived_flag = False
-        self._ds = self._carrot_speed * self._update_rate
+        self._ds = self._carrot_speed / self._update_rate
+        self.distance_error = 0.0
 
         self._yaw_p_gain = self._node.get_parameter('yaw_p_gain').get_parameter_value().double_value
         self._yaw_i_gain = self._node.get_parameter('yaw_i_gain').get_parameter_value().double_value
@@ -210,7 +222,7 @@ class FloatsamGoInFormationAction():
             robot_name = f'{self._robot_base_name}_{robot_id}'
             
             if robot_name != self._this_robot_name:
-                self._peer_errors[robot_name] = 0.0 
+                self._peer_errors[robot_name] = None 
                 
                 topic_name = f'/{robot_name}/formation_error'
                 
@@ -221,28 +233,50 @@ class FloatsamGoInFormationAction():
                     self._best_effort_qos 
                 )
 
+    def _peers_ready_subscriptions(self) -> None:
+        self._peer_ready = {}
+        for robot_id in self._robot_ids:
+            robot_name = f'{self._robot_base_name}_{robot_id}'
+            if robot_name != self._this_robot_name:
+                self._peer_ready[robot_name] = False
+                topic_name = f'/{robot_name}/mission_ready'
+                self._node.create_subscription(
+                    Bool,
+                    topic_name,
+                    lambda msg, rn=robot_name: self._peer_ready_cb(msg, rn),
+                    self._best_effort_qos
+                )
+
+    def _peer_ready_cb(self, msg: Bool, robot_name: str) -> None:
+        self._peer_ready[robot_name] = msg.data
+
     def create_node_publishers(self) -> None:
         self._move_on_place_publisher = self._node.create_publisher(Bool, 'move_on_place', 1)
-        self._best_effort_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1
-        )
 
-        self._yaw_reference_publisher = self._node.create_publisher(
-            FloatStamped, FloatsamTopics.YAW_SETPOINT, self._best_effort_qos)
+        self._yaw_reference_publisher = self._node.create_publisher(FloatStamped, FloatsamTopics.YAW_SETPOINT, self._best_effort_qos)
         
-        self._speed_reference_publisher = self._node.create_publisher(
-            FloatStamped, FloatsamTopics.VELOCITY_SETPOINT, self._best_effort_qos)
+        self._speed_reference_publisher = self._node.create_publisher(FloatStamped, FloatsamTopics.VELOCITY_SETPOINT, self._best_effort_qos)
         
-        self._error_publisher = self._node.create_publisher(
-            FloatStamped, 'formation_error', self._best_effort_qos)
+        self._error_publisher = self._node.create_publisher(FloatStamped, 'formation_error', self._best_effort_qos)
+        self.thruster_port_pub = self._node.create_publisher(Float32,FloatsamTopics.THRUSTER_PORT_CMD, 1)
+        self.thruster_strb_pub = self._node.create_publisher(Float32, FloatsamTopics.THRUSTER_STRB_CMD, 1)
+        
+        self._ready_publisher = self._node.create_publisher(Bool, 'mission_ready', self._best_effort_qos)
+
+    def _heading_callback(self, msg:Float32) ->None:
+        self._heading = msg.data
 
     def create_subscriptions(self) -> None:
         self._odometry_subscriptions()
         self._peers_error_subscriptions()
-
-      
+        self._peers_ready_subscriptions()
+        heading_topic = f'/{self._this_robot_name}/smarc/heading'
+        self._heading_subscriber = self._node.create_subscription(
+            Float32, 
+            heading_topic, 
+            self._heading_callback, 
+            10
+        )
 
 
 #     Goal Structure :
@@ -344,14 +378,14 @@ class FloatsamGoInFormationAction():
 
             self._node.get_logger().info(
             f'Waiting for odometry... (Got {len(self._robot_positions)}/{required_robot_count})', 
-            throttle_duration_sec=1.0
+            throttle_duration_sec=2.0
             )
             time.sleep(0.5)
 
         if len(self._robot_positions) != required_robot_count:
             self._node.get_logger().error(
             f'Error while waiting for odometry... (Got {len(self._robot_positions)}/{required_robot_count}) after the time out.', 
-            throttle_duration_sec=1.0
+            throttle_duration_sec=2.0
             )
             return False 
         
@@ -408,7 +442,7 @@ class FloatsamGoInFormationAction():
             self._node.get_logger().error('Assignment Failed. Aborting loop preparation')
             return 
         
-        self._path_parametrizer = PathParameterizer(self._this_robot_waypoints)
+        self._path_parametrizer = PathParameterizer(self._this_robot_waypoints, self._look_a_head_distance)
         self._move_to_pending = False
         self._node.get_logger().info('Loop correctly prepared.')
 
@@ -428,37 +462,46 @@ class FloatsamGoInFormationAction():
 
         self._yaw_reference_publisher.publish(yaw_msg)
         self._speed_reference_publisher.publish(speed_msg)
-        self._move_on_place_publisher.publish(move_on_place_msg)
 
-        self._node.get_logger().info(f'Publishing desired speed: {desired_speed} and desired_heading{desired_heading}', throttle_duration_sec=1.0)
+    def _everyone_following(self) -> bool:
+        required_robot_count = self._num_robots - 1 
 
-    def _everyone_following(self, time_out: float = 5.0) -> bool:
-        required_robot_count = len(self._tracks_in_map)
-        start_time = time.time()
-
-        while (time.time() - start_time) < time_out:
-            if len(self._peer_errors) == required_robot_count:
-                break
-
-            self._node.get_logger().info(
-            f'Waiting for peers error... (Got {len(self._peer_errors)}/{required_robot_count})', 
-            throttle_duration_sec=1.0
-            )
-            time.sleep(0.5)
-
-        if len(self._robot_positions) != required_robot_count:
+        if len(self._robot_positions) -1 != required_robot_count:
             self._node.get_logger().error(
-            f'Error while waiting for peer error... (Got {len(self._peer_errors)}/{required_robot_count}) after the time out.', 
-            throttle_duration_sec=1.0
-            )
+            f'Error while waiting for peer error... (Got {len(self._peer_errors)}/{required_robot_count}) after the time out.', throttle_duration_sec=2.0)
             return False 
         
-        
+
+        for robot_name in self._peer_errors:
+            if self._peer_errors[robot_name] is None:
+                self._node.get_logger().info(f'Initializing the errors', throttle_duration_sec=2.0)
+                return False
+            if self._peer_errors[robot_name] > self._catch_up_distance:
+                self._node.get_logger().info(f'{robot_name} is not catching up the carrot, its distance is: {self._peer_errors[robot_name]}', throttle_duration_sec=2.0)
+                return False
         
         return True
 
+    def _is_mission_complete(self) -> bool:
+        if not self._path_parametrizer.is_at_end:
+            return False
+        if self.distance_error >= self._catch_up_distance:
+            return False
+        for robot_name, ready in self._peer_ready.items():
+            if not ready:
+                return False
+        return True
+
     def _loop_inner(self):
-        self._path_parametrizer.advance_carrot(self._ds)
+
+        is_formation_moving = self._everyone_following() and self.distance_error < self._catch_up_distance
+
+        if is_formation_moving:
+            self._node.get_logger().info('Everyone is following the carrot, advancing the carrot', throttle_duration_sec=2.0)
+            self._path_parametrizer.advance_carrot(self._ds)
+        else:
+            self._node.get_logger().info('Stopping the carrot for this step', throttle_duration_sec=2.0)
+
         main_carrot_position, lookahead_carrot = self._path_parametrizer.get_carrots()
         main_carrot_x = main_carrot_position[0]
         main_carrot_y = main_carrot_position[1]
@@ -469,14 +512,40 @@ class FloatsamGoInFormationAction():
         robot_x = self._robot_positions[self._this_robot_name].pose.position.x
         robot_y = self._robot_positions[self._this_robot_name].pose.position.y
                 
-        distance_error = math.hypot(main_carrot_x - robot_x, main_carrot_y - robot_y)
-        desired_heading = math.atan2(lookahead_carrot_y - robot_y, lookahead_carrot_x - robot_x)
-        v_desired = self._carrot_speed + distance_error * self._catch_up_gain
- 
-        self._publish_references(v_desired, desired_heading)
+        self.distance_error = math.hypot(main_carrot_x - robot_x, main_carrot_y - robot_y)
+        self._node.get_logger().info(f'The distace from the carrot is:{self.distance_error}',throttle_duration_sec=2.0)
+        desired_heading = math.atan2(main_carrot_y - robot_y, main_carrot_x - robot_x)
+        v_desired = self._carrot_speed + self.distance_error * self._catch_up_gain
+
+        max_safe_speed = 1.0
+        v_command = min(max_safe_speed, v_desired)
+
+        own_ready = self._path_parametrizer.is_at_end and self.distance_error < self._catch_up_distance
+        ready_msg = Bool()
+        ready_msg.data = bool(own_ready)
+        self._ready_publisher.publish(ready_msg)
+
+        distacne_error_msg = FloatStamped()
+        distacne_error_msg.header.stamp = self._node.get_clock().now().to_msg()
+        distacne_error_msg.data = self.distance_error
+        self._error_publisher.publish(distacne_error_msg)
+
+
+        if not is_formation_moving and self.distance_error < self._catch_up_distance:
+            self._node.get_logger().info('Carrot stopped and I caught up. Idling thrusters!', throttle_duration_sec=2.0)
+            thruster_port_msg = Float32()
+            thruster_strb_msg = Float32()
+            thruster_port_msg.data = 0.0
+            thruster_strb_msg.data = 0.0
+            self.thruster_port_pub.publish(thruster_port_msg)
+            self.thruster_strb_pub.publish(thruster_strb_msg) 
+        else:
+            self._publish_references(v_command, desired_heading)
         
-
-
+        if self._is_mission_complete():
+            self._node.get_logger().info('Mission complete. All robots reached end of tracks.')
+            return True
+        
     def _on_cancel_received(self) -> bool:
         self._node.get_logger().info("Cancel requested, stopping...")
         self._goal_in_map = None

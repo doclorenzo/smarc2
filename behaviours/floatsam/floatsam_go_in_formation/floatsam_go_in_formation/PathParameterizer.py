@@ -15,7 +15,6 @@ class PathParameterizer:
             self._s_table.append(self._s_table[-1] + dist)
         
         self._current_s = 0.0
-        # Save the parameter, we will calculate the actual lookahead dynamically
         self._look_a_head_distance = look_a_head_distance 
 
     def advance_carrot(self, ds: float) -> None:
@@ -28,7 +27,6 @@ class PathParameterizer:
         """
         PRIVATE HELPER: Returns the [X, Y] coordinate for ANY given distance along the track.
         """
-        # Clamp to the end of the track (Safeguard)
         if target_s >= self._s_table[-1]:
             return self._map_waypoints[-1]
             
@@ -57,3 +55,7 @@ class PathParameterizer:
         lookahead_carrot = self._get_position_at_s(lookahead_s)
         
         return main_carrot, lookahead_carrot
+    
+    @property
+    def is_at_end(self) -> bool:
+        return self._current_s >= self._s_table[-1]
