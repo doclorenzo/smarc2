@@ -15,6 +15,8 @@ from floatsam_go_in_formation.PathSmoothing import PathSmoother
 
 import time
 import traceback
+import json
+import paho.mqtt.client as mqtt
 
 from std_msgs.msg import Bool, Float32
 from geographic_msgs.msg import GeoPoint
@@ -74,6 +76,15 @@ class FloatsamGoInFormationAction():
 
         self.create_subscriptions()
         self.create_node_publishers()
+
+        # MQTT bridge for real-hardware inter-robot coordination
+        self._mqtt_client = None
+        self._mqtt_connected = False
+        self._mqtt_broker_ip = '20.240.40.232'
+        self._mqtt_broker_port = 1884
+        self._mqtt_client_id = f'go_in_formation_{self._this_robot_name}'
+        if not self._use_sim:
+            self._setup_mqtt_client()
 
         self._param_cb_group = MutuallyExclusiveCallbackGroup()
         self.create_clients()
@@ -145,6 +156,104 @@ class FloatsamGoInFormationAction():
         self._velocity_p_gain = self._node.get_parameter('velocity_p_gain').get_parameter_value().double_value
         self._velocity_i_gain = self._node.get_parameter('velocity_i_gain').get_parameter_value().double_value
         self._velocity_d_gain = self._node.get_parameter('velocity_d_gain').get_parameter_value().double_value
+
+    # ------------------------------------------------------------------
+    # MQTT bridge (real hardware only)
+    # ------------------------------------------------------------------
+
+    def _setup_mqtt_client(self) -> None:
+        try:
+            self._mqtt_client = mqtt.Client(client_id=self._mqtt_client_id)
+            self._mqtt_client.on_connect = self._mqtt_on_connect
+            self._mqtt_client.on_disconnect = self._mqtt_on_disconnect
+            self._mqtt_client.on_message = self._mqtt_on_message
+            self._mqtt_client.connect(self._mqtt_broker_ip, self._mqtt_broker_port, keepalive=60)
+            self._mqtt_client.loop_start()
+            self._node.get_logger().info(
+                f'MQTT: Connecting to {self._mqtt_broker_ip}:{self._mqtt_broker_port}...'
+            )
+        except Exception as e:
+            self._node.get_logger().error(f'MQTT setup failed: {e}')
+            self._mqtt_client = None
+
+    def _mqtt_on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self._mqtt_connected = True
+            self._node.get_logger().info('MQTT: Connected.')
+            self._mqtt_subscribe_to_peers()
+        else:
+            self._node.get_logger().error(f'MQTT: Connection failed with code {rc}')
+
+    def _mqtt_on_disconnect(self, client, userdata, rc):
+        self._mqtt_connected = False
+        if rc != 0:
+            self._node.get_logger().warn(f'MQTT: Unexpected disconnection (code {rc})')
+
+    def _mqtt_on_message(self, client, userdata, msg):
+        try:
+            topic_parts = msg.topic.split('/')
+            if len(topic_parts) < 2:
+                return
+            robot_name = topic_parts[0]
+            topic_suffix = '/'.join(topic_parts[1:])
+            payload = json.loads(msg.payload.decode('utf-8'))
+
+            if topic_suffix == 'formation_error':
+                float_msg = FloatStamped()
+                float_msg.data = float(payload['data'])
+                self._peer_error_cb(float_msg, robot_name)
+
+            elif topic_suffix == 'mission_ready':
+                bool_msg = Bool()
+                bool_msg.data = bool(payload['data'])
+                self._peer_ready_cb(bool_msg, robot_name)
+
+        except Exception as e:
+            self._node.get_logger().error(
+                f'MQTT: Failed to parse message from {msg.topic}: {e}',
+                throttle_duration_sec=5.0
+            )
+
+    def _mqtt_subscribe_to_peers(self) -> None:
+        for robot_id in self._robot_ids:
+            peer_name = f'{self._robot_base_name}_{robot_id}'
+            if peer_name == self._this_robot_name:
+                continue
+            for suffix in ('formation_error', 'mission_ready'):
+                topic = f'{peer_name}/{suffix}'
+                self._mqtt_client.subscribe(topic)
+                self._node.get_logger().info(f'MQTT: Subscribed to {topic}')
+
+    def _mqtt_publish_formation_error(self, error_value: float, stamp) -> None:
+        if self._mqtt_client is None or not self._mqtt_connected:
+            return
+        try:
+            payload = json.dumps({
+                'data': error_value,
+                'stamp': {'sec': stamp.sec, 'nsec': stamp.nanosec}
+            })
+            self._mqtt_client.publish(
+                f'{self._this_robot_name}/formation_error', payload, qos=0
+            )
+        except Exception as e:
+            self._node.get_logger().error(
+                f'MQTT: Failed to publish formation_error: {e}', throttle_duration_sec=5.0
+            )
+
+    def _mqtt_publish_mission_ready(self, ready: bool) -> None:
+        if self._mqtt_client is None or not self._mqtt_connected:
+            return
+        try:
+            payload = json.dumps({'data': ready})
+            self._mqtt_client.publish(
+                f'{self._this_robot_name}/mission_ready', payload, qos=0
+            )
+        except Exception as e:
+            self._node.get_logger().error(
+                f'MQTT: Failed to publish mission_ready: {e}', throttle_duration_sec=5.0
+            )
+
+    # ------------------------------------------------------------------
 
     def create_clients(self) -> None:
         captain_node_name = f'/{self._this_robot_name}/captain'
@@ -434,14 +543,11 @@ class FloatsamGoInFormationAction():
     def _prepare_loop(self) -> None: 
         self._node.get_logger().info('Preparing loop.')
 
-        # 1. Initialize smoother with converted GeoPoints
         self._path_smoother = PathSmoother(master_track_ps=self._track_in_map)
 
         # 2. Get formation width parameter dynamically (defaulting to 4.0 if not declared)
         formation_width = 4.0 
 
-        # 3. CRITICAL: In a master-anchored setup, the maximum offset from the 
-        # master path is the full formation_width, not formation_width / 2.0.
         max_offset = float(formation_width)
 
         # 4. Run the curvature check loop against the full width
@@ -537,10 +643,10 @@ class FloatsamGoInFormationAction():
         is_formation_moving = self._everyone_following() and self.distance_error < self._catch_up_distance
 
         if is_formation_moving:
-            #self._node.get_logger().info('Everyone is following the carrot, advancing the carrot', throttle_duration_sec=2.0)
+            self._node.get_logger().info('Everyone is following the carrot, advancing the carrot', throttle_duration_sec=2.0)
             self._path_parametrizer.advance_carrot(self._ds)
         else:
-            #self._node.get_logger().info('Stopping the carrot for this step', throttle_duration_sec=5.0)
+            self._node.get_logger().info('Stopping the carrot for this step', throttle_duration_sec=5.0)
             pass 
 
         main_carrot_position, lookahead_carrot = self._path_parametrizer.get_carrots()
@@ -573,6 +679,10 @@ class FloatsamGoInFormationAction():
         distacne_error_msg.data = self.distance_error
         self._error_publisher.publish(distacne_error_msg)
 
+        if not self._use_sim:
+            self._mqtt_publish_formation_error(self.distance_error, distacne_error_msg.header.stamp)
+            self._mqtt_publish_mission_ready(bool(own_ready))
+
 
         if not is_formation_moving and self.distance_error < self._catch_up_distance:
             self._node.get_logger().info('Carrot stopped and I caught up. Idling thrusters!', throttle_duration_sec=2.0)
@@ -584,14 +694,14 @@ class FloatsamGoInFormationAction():
             self.thruster_strb_pub.publish(thruster_strb_msg) 
         else:
             self._publish_references(v_command, desired_heading)
-            des_deg = desired_heading * 180 / math.pi
-            if des_deg < 0:
-                des_deg += 360
-            error_heading = self._heading - des_deg
-            self._node.get_logger().info(f'des_deg:{des_deg}', throttle_duration_sec=2.0)
-            self._node.get_logger().info(f'self._heading:{self._heading}', throttle_duration_sec=2.0)
-
-            self._node.get_logger().info(f'error_heading:{error_heading}', throttle_duration_sec=2.0)
+            #des_deg = desired_heading * 180 / math.pi
+            #if des_deg < 0:
+            #    des_deg += 360
+            #error_heading = self._heading - des_deg
+            #self._node.get_logger().info(f'des_deg:{des_deg}', throttle_duration_sec=2.0)
+            #self._node.get_logger().info(f'self._heading:{self._heading}', throttle_duration_sec=2.0)
+#
+            #self._node.get_logger().info(f'error_heading:{error_heading}', throttle_duration_sec=2.0)
         
         if self._is_mission_complete():
             self._node.get_logger().info('Mission complete. All robots reached end of tracks.')
