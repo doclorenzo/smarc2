@@ -16,7 +16,6 @@ Topic bridge node that converts Floatsam-specific topics (from simulator or real
   - Depth pressure → `smarc/depth`
   - Odometry → `smarc/odom`, `smarc/course`, `smarc/speed`
   - Battery → `smarc/battery_percent`
-  - Leak sensor → `floatsam/leak_status`
 
 ### Usage
 
@@ -35,7 +34,8 @@ ros2 launch floatsam_topic_bridge floatsam_bridge.launch.py use_sim:=false
 ### Configuration Files
 
 - **[sim_topics.yaml](floatsam_topic_bridge/config/sim_topics.yaml)** - Simulator topic mappings (ready to use)
-- **[real_topics.yaml](floatsam_topic_bridge/config/real_topics.yaml)** - Real hardware topic mappings (⚠️ PLACEHOLDERS - must be updated!)
+
+
 
 ### Topics Published
 

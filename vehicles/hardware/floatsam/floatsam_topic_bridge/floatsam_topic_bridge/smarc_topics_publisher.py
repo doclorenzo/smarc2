@@ -1,42 +1,34 @@
 #!/usr/bin/env python3
 """
-SMaRC Topics Publisher Node for Floatsam
-Converts simulator or real hardware topics to standard SMaRC topics
+SMaRC Topics Publisher Node for Floatsam (Simulation only)
+Converts simulator topics to standard SMaRC topics
 """
 
 import rclpy
 from rclpy.node import Node
 import math
 import importlib
-import json
-import paho.mqtt.client as mqtt
-from septentrio_gnss_driver.msg import AttEuler
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 
-from px4_msgs.msg import OffboardControlMode, VehicleControlMode, VehicleThrustSetpoint, VehicleTorqueSetpoint, SensorGps, VehicleLocalPosition
-
 # ROS message types
-from sensor_msgs.msg import NavSatFix, Imu, FluidPressure, Range, Image, PointCloud2
+from sensor_msgs.msg import NavSatFix, Imu, FluidPressure
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float32, Bool
+from std_msgs.msg import Float32
 from geographic_msgs.msg import GeoPoint
 from tf_transformations import euler_from_quaternion
-from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster, Buffer, TransformListener
-from geometry_msgs.msg import TransformStamped, Twist
-from smarc_utilities.georef_utils import convert_latlon_to_utm
+from tf2_ros import Buffer, TransformListener
+from rclpy.time import Time
 
 from floatsam_controllers.floatsam_common import FloatSam
 
-ASKO_LAT = 59.3070981
-ASKO_LON = 18.7085827
 
 class SmarcTopicsPublisher(Node):
     """
-    Bridge node that converts Floatsam-specific topics (sim or real) to standard SMaRC topics.
+    Bridge node that converts Floatsam simulator topics to standard SMaRC topics.
     Topic configurations are loaded automatically via ROS 2 parameters from a YAML file.
     Topic namespacing is handled externally by PushRosNamespace in the launch file.
     """
-    
+
     def __init__(self):
 
         # Tell ROS 2 to automatically accept all parameters passed from the YAML file
@@ -46,42 +38,17 @@ class SmarcTopicsPublisher(Node):
             automatically_declare_parameters_from_overrides=True
         )
 
-
         self.robot_name = self.get_parameter("robot_name").get_parameter_value().string_value
-        self.use_sim = self.get_parameter("use_sim").get_parameter_value().bool_value
         self.thruster_limit = self.get_parameter("thruster_limit").get_parameter_value().double_value
-        self.master_robot_name = self.get_parameter('master_floatsam').get_parameter_value().string_value
-        self.num_of_robots = self.get_parameter('num_of_robots').get_parameter_value().integer_value
 
-        # Setup robot IDs for multi-agent coordination
-        self.robot_ids = range(self.num_of_robots)
-        self.robot_base_name = '_'.join(self.robot_name.split('_')[:-1])
-        
-        self.floatsam = FloatSam(self, self.robot_name, use_sim=self.use_sim)
+        self.floatsam = FloatSam(self, self.robot_name, use_sim=True)
 
         if self.thruster_limit <= 0.0:
             self.get_logger().warn('Parameter thruster_limit must be > 0. Falling back to 1000.0 RPM')
             self.thruster_limit = 1000.0
 
-        # --- DYNAMIC QoS AND CONFIG SETUP ---
-        if self.use_sim:
-            self.px4_qos = 10
-            self.actuator_qos = 10
-            self.get_logger().info('SIMULATION MODE: Using standard QoS (10)')
-        else:
-            self.px4_qos = QoSProfile(
-                reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
-                history=QoSHistoryPolicy.KEEP_LAST,
-                depth=1
-            )
-            self.actuator_qos = QoSProfile(
-                reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                durability=QoSDurabilityPolicy.VOLATILE,
-                history=QoSHistoryPolicy.KEEP_LAST,
-                depth=1
-            )
-            self.get_logger().info('REAL HARDWARE MODE: Using PX4 Best-Effort QoS')
+        # Standard QoS for simulation
+        self.qos = 10
 
         # Reconstruct the configuration dictionaries directly from ROS 2 parameters
         self.config = {
@@ -94,31 +61,10 @@ class SmarcTopicsPublisher(Node):
         self.latest_odom = None
         self.latest_gps_left = None
         self.latest_gps_right = None
-        self.latest_rtk_position = None
-        self.is_receiving_rtk_heading = False
-        self.latest_rtk_heading_rad = float('nan')
 
         self.latest_port_cmd = 0.0
         self.latest_strb_cmd = 0.0
         self.last_cmd_time = self.get_clock().now()
-        self.is_offboard = False
-
-        self.last_ekf_reset_counter = 0
-        
-        # Message counters for debugging
-        self._msg_count_odom = 0
-        self._msg_count_gps_left = 0
-        self._msg_count_gps_right = 0
-        self._msg_count_rtk_pos = 0
-        self._msg_count_rtk_heading = 0
-        self._msg_count_imu = 0
-        self.raw_px4_x = 0.0
-        self.raw_px4_y = 0.0
-        self.odom_offset_x = 0.0
-        self.odom_offset_y = 0.0
-        self.latest_px4_timestamp = 0 
-
-        self._actuator_motors_cls = None
 
         # Relative topics — PushRosNamespace will prepend robot_name automatically
         self.heading_pub = self.create_publisher(Float32, 'smarc/heading', 10)
@@ -126,8 +72,8 @@ class SmarcTopicsPublisher(Node):
         self.speed_pub   = self.create_publisher(Float32, 'smarc/speed', 10)
         self.latlon_pub  = self.create_publisher(GeoPoint, 'smarc/latlon', 10)
 
-        # BEST_EFFORT QoS for odom_in_map and MQTT odom bridges.
-        # Any external subscriber to these topics MUST also use BEST_EFFORT.
+        # BEST_EFFORT QoS for odom_in_map.
+        # Any external subscriber to this topic MUST also use BEST_EFFORT.
         self.odom_in_map_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
@@ -136,64 +82,15 @@ class SmarcTopicsPublisher(Node):
         )
         self.odom_in_map_pub = self.create_publisher(Odometry, 'smarc/odom_in_map', self.odom_in_map_qos)
 
-        # MQTT Configuration (placeholders)
-        self.mqtt_broker_ip = '20.240.40.232'  # TODO: Replace with your Mosquitto server IP
-        self.mqtt_broker_port = 1884           # TODO: Replace with your broker port if different
-        self.mqtt_client_id = f'floatsam_{self.robot_name}'
-        self.mqtt_odom_topic = f'{self.robot_name}/smarc/odom_in_map'  # Matches ROS topic structure
-        self.mqtt_client = None
-        self.mqtt_connected = False
-        
-        # Storage for other robots' odom publishers and MQTT subscriptions
-        self._other_robots_odom_pubs = {}
-        self._mqtt_subscriptions = {}
-        
-        # --- Auto-Datum Variables ---
-        self.datum_is_set = False
-        self.datum_utm_x = 0.0
-        self.datum_utm_y = 0.0
-        self.datum_zone = "utm"
-
-        # Multi-agent variables
-        self.local_map_offset_x = 0.0
-        self.local_map_offset_y = 0.0
-
-        # Initialize MQTT client
-        self._setup_mqtt_client()
-        
-        # Setup MQTT subscriptions for other robots' odometry
-        self._setup_mqtt_odom_subscriptions()
-
-        # Initialize TF buffer and broadcasters BEFORE setting up topic bridges
-        # (GPS callbacks will immediately try to publish transforms)
+        # TF buffer/listener (used to convert odometry into the shared "map" frame)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        # TF Broadcasters
-        self.tf_broadcaster = TransformBroadcaster(self)
-        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
 
         # Create subscribers and publishers from YAML config
         self._setup_topic_bridges()
 
-        # PX4 topics: absolute paths prefixed with robot_name to isolate per-robot
-        self.offboard_mode_pub = self.create_publisher(
-            OffboardControlMode,
-            f'fmu/in/offboard_control_mode',
-            self.actuator_qos
-        )
-        self.create_subscription(
-            VehicleControlMode,
-            f'fmu/out/vehicle_control_mode',
-            self._control_mode_callback,
-            self.px4_qos
-        )
-
         self.get_logger().info(f'Floatsam SMaRC Topics Publisher started for: {self.robot_name}')
         self.control_loop_timer = self.create_timer(0.1, self._control_loop_callback)
-        
-        # Diagnostic timer to track message rates
-        self.diagnostic_timer = self.create_timer(5.0, self._diagnostic_callback)
 
     def _get_nested_params(self, prefix):
         result = {}
@@ -208,188 +105,6 @@ class SmarcTopicsPublisher(Node):
                 current_level = current_level[part]
             current_level[parts[-1]] = param.value
         return result
-
-    def _setup_mqtt_client(self):
-        """Initialize and connect the MQTT client for publishing odom_in_map."""
-        try:
-            self.mqtt_client = mqtt.Client(client_id=self.mqtt_client_id)
-            self.mqtt_client.on_connect = self._mqtt_on_connect
-            self.mqtt_client.on_disconnect = self._mqtt_on_disconnect
-            self.mqtt_client.on_publish = self._mqtt_on_publish
-            self.mqtt_client.on_message = self._mqtt_on_message
-            
-            self.get_logger().info(f'Connecting to MQTT broker at {self.mqtt_broker_ip}:{self.mqtt_broker_port}...')
-            self.mqtt_client.connect(self.mqtt_broker_ip, self.mqtt_broker_port, keepalive=60)
-            self.mqtt_client.loop_start()
-            
-        except Exception as e:
-            self.get_logger().error(f'Failed to initialize MQTT client: {e}')
-            self.mqtt_client = None
-
-    def _mqtt_on_connect(self, client, userdata, flags, rc):
-        """Callback for when the MQTT client connects."""
-        if rc == 0:
-            self.mqtt_connected = True
-            self.get_logger().info(f'MQTT client connected successfully.')
-            self.get_logger().info(f'  Publishing: {self.mqtt_odom_topic}')
-            # Subscribe to other robots' odometry topics
-            self._subscribe_to_mqtt_odom_topics()
-        else:
-            self.get_logger().error(f'MQTT connection failed with code {rc}')
-
-    def _mqtt_on_disconnect(self, client, userdata, rc):
-        """Callback for when the MQTT client disconnects."""
-        self.mqtt_connected = False
-        if rc != 0:
-            self.get_logger().warn(f'MQTT unexpected disconnection with code {rc}. Attempting to reconnect...')
-
-    def _mqtt_on_publish(self, client, userdata, mid):
-        """Callback for when a message is published to MQTT."""
-        pass  # Silent callback to avoid log spam
-
-    def _mqtt_on_message(self, client, userdata, msg):
-        """Callback for incoming MQTT messages (odometry from other robots)."""
-        try:
-            # Parse the topic to extract robot name
-            # Expected format: <robot_name>/smarc/odom_in_map
-            topic_parts = msg.topic.split('/')
-            if len(topic_parts) >= 3 and topic_parts[1] == 'smarc' and topic_parts[2] == 'odom_in_map':
-                robot_name = topic_parts[0]
-                
-                # Parse the incoming JSON odometry message
-                odom_dict = json.loads(msg.payload.decode('utf-8'))
-                
-                # Check if we have a publisher for this robot
-                if robot_name not in self._other_robots_odom_pubs:
-                    return
-                
-                # Reconstruct Odometry message from JSON
-                odom_msg = self._dict_to_odometry(odom_dict)
-                
-                # Republish to local ROS topic
-                self._other_robots_odom_pubs[robot_name].publish(odom_msg)
-                
-        except Exception as e:
-            self.get_logger().error(f'Failed to parse MQTT message from {msg.topic}: {e}', throttle_duration_sec=5.0)
-
-    def _publish_odom_to_mqtt(self, odom_msg: Odometry):
-        """Convert and publish Odometry message to MQTT broker as JSON."""
-        if self.mqtt_client is None or not self.mqtt_connected:
-            return
-        
-        try:
-            # Convert Odometry message to JSON
-            odom_dict = {
-                'header': {
-                    'stamp': {
-                        'sec': odom_msg.header.stamp.sec,
-                        'nsec': odom_msg.header.stamp.nanosec
-                    },
-                    'frame_id': odom_msg.header.frame_id
-                },
-                'child_frame_id': odom_msg.child_frame_id,
-                'pose': {
-                    'position': {
-                        'x': float(odom_msg.pose.pose.position.x),
-                        'y': float(odom_msg.pose.pose.position.y),
-                        'z': float(odom_msg.pose.pose.position.z)
-                    },
-                    'orientation': {
-                        'w': float(odom_msg.pose.pose.orientation.w),
-                        'x': float(odom_msg.pose.pose.orientation.x),
-                        'y': float(odom_msg.pose.pose.orientation.y),
-                        'z': float(odom_msg.pose.pose.orientation.z)
-                    }
-                },
-                'twist': {
-                    'linear': {
-                        'x': float(odom_msg.twist.twist.linear.x),
-                        'y': float(odom_msg.twist.twist.linear.y),
-                        'z': float(odom_msg.twist.twist.linear.z)
-                    },
-                    'angular': {
-                        'x': float(odom_msg.twist.twist.angular.x),
-                        'y': float(odom_msg.twist.twist.angular.y),
-                        'z': float(odom_msg.twist.twist.angular.z)
-                    }
-                }
-            }
-            
-            # Publish to MQTT with best effort (QoS 0)
-            payload = json.dumps(odom_dict)
-            self.mqtt_client.publish(self.mqtt_odom_topic, payload, qos=0)
-            
-        except Exception as e:
-            self.get_logger().error(f'Failed to publish to MQTT: {e}', throttle_duration_sec=5.0)
-
-    def _setup_mqtt_odom_subscriptions(self):
-        """Create ROS publishers for receiving other robots' odometry via MQTT.
-        Uses odom_in_map_qos (BEST_EFFORT) to match the publisher on the other side."""
-        for robot_id in self.robot_ids:
-            robot_name = f'{self.robot_base_name}_{robot_id}'
-            
-            # Skip the current robot
-            if robot_name == self.robot_name:
-                continue
-            
-            # BEST_EFFORT to match odom_in_map_qos
-            pub = self.create_publisher(
-                Odometry,
-                f'/{robot_name}/smarc/odom_in_map',
-                self.odom_in_map_qos
-            )
-            self._other_robots_odom_pubs[robot_name] = pub
-            self.get_logger().info(f'Created MQTT->ROS bridge for {robot_name}/smarc/odom_in_map')
-
-    def _subscribe_to_mqtt_odom_topics(self):
-        """Subscribe to MQTT topics for all other robots' odometry."""
-        for robot_id in self.robot_ids:
-            robot_name = f'{self.robot_base_name}_{robot_id}'
-            
-            # Skip the current robot
-            if robot_name == self.robot_name:
-                continue
-            
-            # Subscribe to this robot's odometry topic on MQTT
-            mqtt_topic = f'{robot_name}/smarc/odom_in_map'
-            self.mqtt_client.subscribe(mqtt_topic)
-            self._mqtt_subscriptions[robot_name] = mqtt_topic
-            self.get_logger().info(f'Subscribed to MQTT topic: {mqtt_topic}')
-
-    def _dict_to_odometry(self, odom_dict):
-        """Convert a dictionary (from JSON) back to an Odometry message."""
-        from rclpy.time import Time
-        
-        odom_msg = Odometry()
-        
-        # Set header
-        odom_msg.header.stamp.sec = odom_dict['header']['stamp']['sec']
-        odom_msg.header.stamp.nanosec = odom_dict['header']['stamp']['nsec']
-        odom_msg.header.frame_id = odom_dict['header']['frame_id']
-        
-        # Set child frame ID
-        odom_msg.child_frame_id = odom_dict['child_frame_id']
-        
-        # Set pose
-        odom_msg.pose.pose.position.x = odom_dict['pose']['position']['x']
-        odom_msg.pose.pose.position.y = odom_dict['pose']['position']['y']
-        odom_msg.pose.pose.position.z = odom_dict['pose']['position']['z']
-        
-        odom_msg.pose.pose.orientation.w = odom_dict['pose']['orientation']['w']
-        odom_msg.pose.pose.orientation.x = odom_dict['pose']['orientation']['x']
-        odom_msg.pose.pose.orientation.y = odom_dict['pose']['orientation']['y']
-        odom_msg.pose.pose.orientation.z = odom_dict['pose']['orientation']['z']
-        
-        # Set twist
-        odom_msg.twist.twist.linear.x = odom_dict['twist']['linear']['x']
-        odom_msg.twist.twist.linear.y = odom_dict['twist']['linear']['y']
-        odom_msg.twist.twist.linear.z = odom_dict['twist']['linear']['z']
-        
-        odom_msg.twist.twist.angular.x = odom_dict['twist']['angular']['x']
-        odom_msg.twist.twist.angular.y = odom_dict['twist']['angular']['y']
-        odom_msg.twist.twist.angular.z = odom_dict['twist']['angular']['z']
-        
-        return odom_msg
 
     def _get_message_class(self, msg_type_str):
         """Dynamically import and return message class from string like 'std_msgs/Float32' or 'pkg/msg/Type'"""
@@ -421,46 +136,20 @@ class SmarcTopicsPublisher(Node):
         if 'gps_left' in sensors:
             msg_class = self._get_message_class(sensors['gps_left']['msg_type'])
             self.create_subscription(msg_class, sensors['gps_left']['input_topic'],
-                                     self._gps_left_callback, self.px4_qos)
+                                     self._gps_left_callback, self.qos)
             self.gps_left_pub = self.create_publisher(NavSatFix, sensors['gps_left']['output_topic'], 10)
 
         if 'gps_right' in sensors:
             msg_class = self._get_message_class(sensors['gps_right']['msg_type'])
             self.create_subscription(msg_class, sensors['gps_right']['input_topic'],
-                                     self._gps_right_callback, self.px4_qos)
+                                     self._gps_right_callback, self.qos)
             self.gps_right_pub = self.create_publisher(NavSatFix, sensors['gps_right']['output_topic'], 10)
             self.get_logger().info(f'  GPS Right: {sensors["gps_right"]["input_topic"]} → {sensors["gps_right"]["output_topic"]}')
-
-        # RTK GPS (high precision)
-        if 'rtk_heading' in sensors:
-            msg_class = self._get_message_class(sensors['rtk_heading']['msg_type'])
-            if msg_class is None:
-                msg_class = AttEuler
-            if msg_class is not None:
-                self.create_subscription(msg_class, sensors['rtk_heading']['input_topic'],
-                                         self._rtk_heading_callback, 10)
-                self.rtk_heading_pub = self.create_publisher(Float32, sensors['rtk_heading']['output_topic'], 10)
-                self.get_logger().info(f'  RTK Heading: {sensors["rtk_heading"]["input_topic"]} → {sensors["rtk_heading"]["output_topic"]}')
-            else:
-                self.get_logger().error("Could not load AttEuler message class. Is septentrio_gnss_driver sourced?")
-
-        if 'rtk_position' in sensors:
-            msg_class = self._get_message_class(sensors['rtk_position']['msg_type'])
-            self.create_subscription(msg_class, sensors['rtk_position']['input_topic'],
-                                     self._rtk_position_callback, 10)
-            self.rtk_position_pub = self.create_publisher(NavSatFix, sensors['rtk_position']['output_topic'], 10)
-            self.get_logger().info(f'  RTK Position: {sensors["rtk_position"]["input_topic"]} → {sensors["rtk_position"]["output_topic"]}')
-
-            # PX4 RTK injection — always absolute, always robot-scoped
-            px4_rtk_topic = sensors['rtk_position'].get('output_for_px4', None)
-            if not self.use_sim and px4_rtk_topic:
-                self.sensor_gps_pub = self.create_publisher(SensorGps, px4_rtk_topic, self.px4_qos)
-                self.get_logger().info(f'  RTK: Injection to {px4_rtk_topic} ENABLED')
 
         # IMU
         if 'imu' in sensors:
             msg_class = self._get_message_class(sensors['imu']['msg_type'])
-            self.create_subscription(msg_class, sensors['imu']['input_topic'], self._imu_callback, self.px4_qos)
+            self.create_subscription(msg_class, sensors['imu']['input_topic'], self._imu_callback, self.qos)
             self.imu_pub = self.create_publisher(Imu, sensors['imu']['output_topic'], 10)
             self.get_logger().info(f'  IMU: {sensors["imu"]["input_topic"]} → {sensors["imu"]["output_topic"]}')
 
@@ -468,23 +157,9 @@ class SmarcTopicsPublisher(Node):
         if 'depth_pressure' in sensors:
             msg_class = self._get_message_class(sensors['depth_pressure']['msg_type'])
             self.create_subscription(msg_class, sensors['depth_pressure']['input_topic'],
-                                     self._depth_callback, self.px4_qos)
+                                     self._depth_callback, self.qos)
             self.depth_pub = self.create_publisher(Float32, sensors['depth_pressure']['output_topic'], 10)
             self.get_logger().info(f'  Depth: {sensors["depth_pressure"]["input_topic"]} → {sensors["depth_pressure"]["output_topic"]}')
-
-        # DVL
-        if 'dvl' in sensors:
-            msg_class = self._get_message_class(sensors['dvl']['msg_type'])
-            self.create_subscription(msg_class, sensors['dvl']['input_topic'], self._dvl_callback, self.px4_qos)
-            self.dvl_pub = self.create_publisher(Range, sensors['dvl']['output_topic'], 10)
-            self.get_logger().info(f'  DVL: {sensors["dvl"]["input_topic"]} → {sensors["dvl"]["output_topic"]}')
-
-        # Leak sensor
-        if 'leak' in sensors:
-            msg_class = self._get_message_class(sensors['leak']['msg_type'])
-            self.create_subscription(msg_class, sensors['leak']['input_topic'], self._leak_callback, self.px4_qos)
-            self.leak_pub = self.create_publisher(msg_class, sensors['leak']['output_topic'], 10)
-            self.get_logger().info(f'  Leak: {sensors["leak"]["input_topic"]} → {sensors["leak"]["output_topic"]}')
 
         # Odometry
         if 'odom_gt' in sensors:
@@ -496,7 +171,7 @@ class SmarcTopicsPublisher(Node):
 
         if odom_config:
             msg_class = self._get_message_class(odom_config['msg_type'])
-            self.create_subscription(msg_class, odom_config['input_topic'], self._odom_callback, self.px4_qos)
+            self.create_subscription(msg_class, odom_config['input_topic'], self._odom_callback, self.qos)
             self.odom_pub = self.create_publisher(Odometry, odom_config['output_topic'], 10)
             self.get_logger().info(f'  Odom: {odom_config["input_topic"]} → {odom_config["output_topic"]}')
             self.get_logger().info(f'  ↳ Also computing heading, course, speed, and latlon from best GPS')
@@ -505,243 +180,69 @@ class SmarcTopicsPublisher(Node):
         if 'battery' in sensors:
             msg_class = self._get_message_class(sensors['battery']['msg_type'])
             self.create_subscription(msg_class, sensors['battery']['input_topic'],
-                                     self._battery_callback, self.px4_qos)
+                                     self._battery_callback, self.qos)
             self.battery_pub = self.create_publisher(Float32, sensors['battery']['output_topic'], 10)
             self.get_logger().info(f'  Battery: {sensors["battery"]["input_topic"]} → {sensors["battery"]["output_topic"]}')
 
-        # Actuators
+        # Actuators (decoupled port/starboard thruster commands)
         if 'thruster_port_cmd' in actuators and 'thruster_strb_cmd' in actuators:
             self.create_subscription(Float32, actuators['thruster_port_cmd']['input_topic'],
                                      self._port_cmd_callback, 10)
             self.create_subscription(Float32, actuators['thruster_strb_cmd']['input_topic'],
                                      self._strb_cmd_callback, 10)
 
-            if self.use_sim:
-                self.sim_port_pub = self.create_publisher(Float32, actuators['thruster_port_cmd']['output_topic'], 10)
-                self.sim_strb_pub = self.create_publisher(Float32, actuators['thruster_strb_cmd']['output_topic'], 10)
-                self.get_logger().info('  Actuators: Bridged as DECOUPLED (Sim Mode)')
-            else:
-                self._actuator_motors_cls = self._get_message_class(actuators['px4_motors']['msg_type'])
-                self.px4_motors_pub = self.create_publisher(
-                    self._actuator_motors_cls,
-                    actuators['px4_motors']['output_topic'],
-                    self.actuator_qos
-                )
-                self.get_logger().info('  Actuators: Bridged as COUPLED (PX4 Mode)')
+            self.sim_port_pub = self.create_publisher(Float32, actuators['thruster_port_cmd']['output_topic'], 10)
+            self.sim_strb_pub = self.create_publisher(Float32, actuators['thruster_strb_cmd']['output_topic'], 10)
+            self.get_logger().info('  Actuators: Bridged (Sim Mode)')
 
         # Payload (passthrough)
         for payload_name, config in payload.items():
             msg_class = self._get_message_class(config['msg_type'])
             if msg_class:
-                pub = self.create_publisher(msg_class, config['output_topic'], self.px4_qos)
+                pub = self.create_publisher(msg_class, config['output_topic'], self.qos)
                 self.create_subscription(msg_class, config['input_topic'],
                                          self._create_passthrough_callback(pub), 10)
                 self.get_logger().info(f'  Payload {payload_name}: {config["input_topic"]} → {config["output_topic"]}')
 
     def _port_cmd_callback(self, msg: Float32):
-        raw = msg.data / self.thruster_limit
-        self.latest_port_cmd = max(-0.6, min(0.6, raw))
+        self.latest_port_cmd  = msg.data
         self.last_cmd_time = self.get_clock().now()
 
     def _strb_cmd_callback(self, msg: Float32):
-        raw = msg.data / self.thruster_limit
-        self.latest_strb_cmd = max(-0.6, min(0.6, raw))
+        self.latest_strb_cmd = msg.data 
         self.last_cmd_time = self.get_clock().now()
 
     def _publish_actuators(self):
-        """Applies safety timeouts and yields to Manual RC"""
+        """Applies a safety timeout that zeroes thrusters if commands stop arriving"""
         dt = (self.get_clock().now() - self.last_cmd_time).nanoseconds / 1e9
         if dt > 0.5:
             self.latest_port_cmd = 0.0
             self.latest_strb_cmd = 0.0
 
-        if self.use_sim:
-            port_msg = Float32()
-            port_msg.data = self.latest_port_cmd * self.thruster_limit
-            strb_msg = Float32()
-            strb_msg.data = self.latest_strb_cmd * self.thruster_limit
-            self.sim_port_pub.publish(port_msg)
-            self.sim_strb_pub.publish(strb_msg)
-        else:
-            if not self.is_offboard:
-                return
-
-            now_us = self.get_clock().now().nanoseconds // 1000
-            px4_msg = self._actuator_motors_cls()
-            px4_msg.timestamp = now_us
-            px4_msg.timestamp_sample = now_us
-            px4_msg.control = [float('nan')] * 12
-            px4_msg.control[0] = float(self.latest_strb_cmd)
-            px4_msg.control[1] = float(self.latest_port_cmd)
-            px4_msg.reversible_flags = 0b00000011
-            self.px4_motors_pub.publish(px4_msg)
+        port_msg = Float32()
+        port_msg.data = self.latest_port_cmd
+        strb_msg = Float32()
+        strb_msg.data = self.latest_strb_cmd
+        self.sim_port_pub.publish(port_msg)
+        self.sim_strb_pub.publish(strb_msg)
 
     def _control_loop_callback(self):
-        """Runs at 10Hz. Publishes the heartbeat and current motor commands continuously."""
-        msg = OffboardControlMode()
-        msg.timestamp = self.get_clock().now().nanoseconds // 1000
-        msg.position = False
-        msg.velocity = False
-        msg.acceleration = False
-        msg.attitude = False
-        msg.body_rate = False
-        msg.thrust_and_torque = False
-        msg.direct_actuator = True
-        self.offboard_mode_pub.publish(msg)
+        """Runs at 10Hz. Applies the actuator safety timeout and publishes current thruster commands."""
         self._publish_actuators()
 
-    def _diagnostic_callback(self):
-        """Runs every 5 seconds. Logs message reception rates for debugging."""
-        self.get_logger().info(
-            f"📊 Message rates (last 5s): "
-            f"Odom={self._msg_count_odom}, "
-            f"GPS_L={self._msg_count_gps_left}, "
-            f"GPS_R={self._msg_count_gps_right}, "
-            f"RTK_Pos={self._msg_count_rtk_pos}, "
-            f"RTK_Heading={self._msg_count_rtk_heading}, "
-            f"IMU={self._msg_count_imu}",
-            throttle_duration_sec=1.0
-        )
-        # Reset counters for next 5-second window
-        self._msg_count_odom = 0
-        self._msg_count_gps_left = 0
-        self._msg_count_gps_right = 0
-        self._msg_count_rtk_pos = 0
-        self._msg_count_rtk_heading = 0
-        self._msg_count_imu = 0
-
     def _gps_left_callback(self, msg):
-        if self.use_sim:
-            std_msg = msg
-        else:
-            std_msg = NavSatFix()
-            # PX4 1.16 uses standard floats, so we remove the division math
-            std_msg.latitude  = float(msg.latitude_deg)
-            std_msg.longitude = float(msg.longitude_deg)
-            std_msg.altitude  = float(msg.altitude_msl_m)
-        self._msg_count_gps_left += 1
-        self.latest_gps_left = std_msg
-        self.gps_left_pub.publish(std_msg)
+        self.latest_gps_left = msg
+        self.gps_left_pub.publish(msg)
         self._publish_best_gps()
 
     def _gps_right_callback(self, msg):
-        if self.use_sim:
-            std_msg = msg
-        else:
-            std_msg = NavSatFix()
-            # PX4 1.16 uses standard floats, so we remove the division math
-            std_msg.latitude  = float(msg.latitude_deg)
-            std_msg.longitude = float(msg.longitude_deg)
-            std_msg.altitude  = float(msg.altitude_msl_m)
-        self._msg_count_gps_right += 1
-        self.latest_gps_right = std_msg
-        self.gps_right_pub.publish(std_msg)
+        self.latest_gps_right = msg
+        self.gps_right_pub.publish(msg)
         self._publish_best_gps()
-
-    def _control_mode_callback(self, msg):
-        self.is_offboard = msg.flag_control_offboard_enabled
-        self.latest_px4_timestamp = msg.timestamp
-
-
-    def _rtk_heading_callback(self, msg):
-        heading = msg.heading
-        if math.isnan(heading):
-            return
-        self._msg_count_rtk_heading += 1
-        if heading < 0.0:
-            corrected_heading = - heading
-        else:
-            corrected_heading = 360.0 - heading
-
-        self.is_receiving_rtk_heading = True
-        heading_rad = math.radians(corrected_heading)
-        if heading_rad > math.pi:
-            self.latest_rtk_heading_rad = heading_rad- 2 * math.pi
-        else:
-            self.latest_rtk_heading_rad = heading_rad
-        heading_msg = Float32()
-        heading_msg.data = float(corrected_heading) % 360.0
-        self.heading_pub.publish(heading_msg)
-
-    def _rtk_position_callback(self, msg: NavSatFix):
-        self._msg_count_rtk_pos += 1
-        self.latest_rtk_position = msg
-        self.rtk_position_pub.publish(msg)
-        self._publish_best_gps()
-
-        if not self.use_sim and hasattr(self, 'sensor_gps_pub'):
-            px4_gps = SensorGps()
-            
-            # --- CLOCK SYNC ---
-            px4_gps.timestamp = self.latest_px4_timestamp
-            px4_gps.timestamp_sample = self.latest_px4_timestamp
-            
-            # EKF requires a valid UTC time, so we convert ROS time to microseconds
-            px4_gps.time_utc_usec = self.get_clock().now().nanoseconds // 1000 
-            px4_gps.device_id = 1310720 # A standard PX4 GPS device ID
-            
-            px4_gps.latitude_deg = float(msg.latitude)
-            px4_gps.longitude_deg = float(msg.longitude)
-            px4_gps.altitude_msl_m = float(msg.altitude)
-            px4_gps.altitude_ellipsoid_m = float(msg.altitude)
-            px4_gps.fix_type = 6
-
-            # --- PREVENT DIVISION BY ZERO IN EKF ---
-            # Clamp the minimum variance to 0.1 so it never hits 0.0
-            if len(msg.position_covariance) == 9 and msg.position_covariance[0] > 0:
-                px4_gps.eph = max(0.1, float(math.sqrt(msg.position_covariance[0])))
-            else:
-                px4_gps.eph = 0.5
-
-            if len(msg.position_covariance) == 9 and msg.position_covariance[8] > 0:
-                px4_gps.epv = max(0.1, float(math.sqrt(msg.position_covariance[8])))
-            else:
-                px4_gps.epv = 0.5
-
-            # These MUST be > 0 or the EKF test ratios become NaN!
-            px4_gps.s_variance_m_s = 0.5  # Speed variance
-            px4_gps.c_variance_rad = 0.5  # Course variance
-
-            # --- HEADING INJECTION SAFETY CHECK ---
-            if not math.isnan(self.latest_rtk_heading_rad):
-                px4_gps.heading = self.latest_rtk_heading_rad
-                px4_gps.heading_offset = 0.0
-                px4_gps.heading_accuracy = 0.05 
-            else:
-                px4_gps.heading = float('nan')
-                px4_gps.heading_offset = float('nan')
-                px4_gps.heading_accuracy = float('nan') # Tell EKF we don't have heading yet
-                
-            px4_gps.satellites_used = 12
-
-            px4_gps.vel_m_s = 0.0
-            px4_gps.vel_n_m_s = 0.0
-            px4_gps.vel_e_m_s = 0.0
-            px4_gps.vel_d_m_s = 0.0
-            px4_gps.vel_ned_valid = False 
-            px4_gps.s_variance_m_s = 0.5  # Tell EKF: "Velocity is valid, but very noisy, trust the IMU more"
-            px4_gps.c_variance_rad = 0.5 
-
-            # --- ADVANCED DEBUG LOGGING ---
-            self.get_logger().info(
-                f"\n--- GPS INJECTION DEBUG ---\n"
-                f"PX4 Clock (ts): {px4_gps.timestamp}\n"
-                f"UTC Clock: {px4_gps.time_utc_usec}\n"
-                f"Lat/Lon: {px4_gps.latitude_deg:.6f}, {px4_gps.longitude_deg:.6f}\n"
-                f"EPH: {px4_gps.eph:.3f}, EPV: {px4_gps.epv:.3f}\n"
-                f"S_Var: {px4_gps.s_variance_m_s:.3f}, C_Var: {px4_gps.c_variance_rad:.3f}\n"
-                f"Heading: {px4_gps.heading:.3f}, H_Acc: {px4_gps.heading_accuracy:.3f}\n"
-                f"---------------------------",
-                throttle_duration_sec=2.0
-            )
-            
-            self.sensor_gps_pub.publish(px4_gps)
-
-
 
     def _publish_best_gps(self):
-        """Publish best available GPS and set the Multi-Agent Auto-Datum on first fix"""
-        best_position = self.latest_rtk_position or self.latest_gps_left or self.latest_gps_right
+        """Publish best available GPS fix as lat/lon."""
+        best_position = self.latest_gps_left or self.latest_gps_right
         if not best_position:
             return
 
@@ -751,89 +252,8 @@ class SmarcTopicsPublisher(Node):
         geopoint.altitude  = best_position.altitude
         self.latlon_pub.publish(geopoint)
 
-        if not self.datum_is_set and not self.use_sim:
-            try:
-                asko_geopoint = GeoPoint()
-                asko_geopoint.latitude  = ASKO_LAT
-                asko_geopoint.longitude = ASKO_LON
-                asko_geopoint.altitude  = 0.0
-
-                utm_point = convert_latlon_to_utm(asko_geopoint)
-                self.datum_zone  = utm_point.header.frame_id
-                self.datum_utm_x = utm_point.point.x
-                self.datum_utm_y = utm_point.point.y
-
-                # All robots share the same hardcoded origin — no master/slave logic needed
-                utm_self = convert_latlon_to_utm(geopoint)
-                self.local_map_offset_x = utm_self.point.x - self.datum_utm_x
-                self.local_map_offset_y = utm_self.point.y - self.datum_utm_y
-
-                self.datum_is_set = True
-                self._publish_static_transforms()
-                self.get_logger().info(
-                    f"MAP ORIGIN LOCKED to Askö. Zone: {self.datum_zone} | "
-                    f"X: {self.datum_utm_x:.2f} | Y: {self.datum_utm_y:.2f} | "
-                    f"Local offset -> X: {self.local_map_offset_x:.2f}m | Y: {self.local_map_offset_y:.2f}m"
-                )
-            except Exception as e:
-                self.get_logger().error(f"Failed to set Askö datum: {e}")
-        # --- ADDED: Calculate the dynamic Map -> Odom offset ---
-        if self.datum_is_set and not self.use_sim:
-            try:
-                utm_point = convert_latlon_to_utm(geopoint)
-                # Absolute map position
-                global_map_x = utm_point.point.x - self.datum_utm_x
-                global_map_y = utm_point.point.y - self.datum_utm_y
-                
-                # Position relative to THIS robot's local map
-                true_local_map_x = global_map_x - self.local_map_offset_x
-                true_local_map_y = global_map_y - self.local_map_offset_y
-                
-                # The "rubber band" difference between true GPS and drifting PX4 Odom
-                self.odom_offset_x = true_local_map_x - self.raw_px4_x
-                self.odom_offset_y = true_local_map_y - self.raw_px4_y
-            except Exception:
-                pass
-
-    def _publish_static_transforms(self):
-        """Creates the permanent links for the shared multi-agent map"""
-        transforms_to_publish = []
-
-        t_utm = TransformStamped()
-        t_utm.header.stamp = self.get_clock().now().to_msg()
-        t_utm.header.frame_id = self.datum_zone
-        t_utm.child_frame_id = "map"
-        t_utm.transform.translation.x = float(self.datum_utm_x)
-        t_utm.transform.translation.y = float(self.datum_utm_y)
-        t_utm.transform.translation.z = 0.0
-        t_utm.transform.rotation.w = 1.0
-        transforms_to_publish.append(t_utm)
-
-        t_global = TransformStamped()
-        t_global.header.stamp = self.get_clock().now().to_msg()
-        t_global.header.frame_id = "map"
-        t_global.child_frame_id = f"{self.robot_name}/map"
-        t_global.transform.translation.x = float(self.local_map_offset_x)
-        t_global.transform.translation.y = float(self.local_map_offset_y)
-        t_global.transform.translation.z = 0.0
-        t_global.transform.rotation.w = 1.0
-        transforms_to_publish.append(t_global)
-
-        self.static_tf_broadcaster.sendTransform(transforms_to_publish)
-
     def _imu_callback(self, msg):
-        self._msg_count_imu += 1
-        if self.use_sim:
-            std_msg = msg
-        else:
-            std_msg = Imu()
-            std_msg.angular_velocity.x = float(msg.gyro_rad[0])
-            std_msg.angular_velocity.y = float(msg.gyro_rad[1])
-            std_msg.angular_velocity.z = float(msg.gyro_rad[2])
-            std_msg.linear_acceleration.x = float(msg.accelerometer_m_s2[0])
-            std_msg.linear_acceleration.y = float(msg.accelerometer_m_s2[1])
-            std_msg.linear_acceleration.z = float(msg.accelerometer_m_s2[2])
-        self.imu_pub.publish(std_msg)
+        self.imu_pub.publish(msg)
 
     def _depth_callback(self, msg: FluidPressure):
         atmospheric_pressure = 101325.0
@@ -843,133 +263,60 @@ class SmarcTopicsPublisher(Node):
         depth_msg.data = depth_m
         self.depth_pub.publish(depth_msg)
 
-    def _dvl_callback(self, msg: Range):
-        self.dvl_pub.publish(msg)
-
-    def _leak_callback(self, msg: Bool):
-        self.leak_pub.publish(msg)
-        if msg.data:
-            self.get_logger().warn('  LEAK DETECTED!')
-
-
-    def _odom_callback(self, msg: VehicleLocalPosition):
-        self._msg_count_odom += 1
-        if self.use_sim:
-            std_msg = msg
-        else:
-            if not msg.xy_valid or msg.dead_reckoning:
-                self.get_logger().warn('PX4 Local Position INVALID (Dead Reckoning). Odometry will drift rapidly!', throttle_duration_sec=2.0)
-
-            if msg.xy_reset_counter != self.last_ekf_reset_counter:
-                self.get_logger().error(f'🚨 EKF ORIGIN RESET DETECTED! 🚨 PX4 shifted the local map! Counter: {self.last_ekf_reset_counter} -> {msg.xy_reset_counter}')
-                self.last_ekf_reset_counter = msg.xy_reset_counter
-
-            self.raw_px4_x = float(msg.y)
-            self.raw_px4_y = float(msg.x)
-
-            std_msg = Odometry()
-            std_msg.header.stamp = self.get_clock().now().to_msg()
-            std_msg.header.frame_id = f"{self.robot_name}/odom"
-            std_msg.child_frame_id = f"{self.robot_name}/base_link"
-            
-            # NED to ENU conversion (Position)
-            std_msg.pose.pose.position.x = self.raw_px4_x
-            std_msg.pose.pose.position.y = self.raw_px4_y
-            std_msg.pose.pose.position.z = float(-msg.z)
-            
-            # NED to ENU conversion (Velocity - Note: This is in the ODOM frame, not base_link!)
-            std_msg.twist.twist.linear.x = float(msg.vy)
-            std_msg.twist.twist.linear.y = float(msg.vx)
-            std_msg.twist.twist.linear.z = float(-msg.vz)
-            
-            if self.is_receiving_rtk_heading and not math.isnan(self.latest_rtk_heading_rad):
-                enu_heading = (math.pi / 2.0) - self.latest_rtk_heading_rad
-            else:
-                enu_heading = (math.pi / 2.0) - float(msg.heading)
-
-            enu_heading = math.atan2(math.sin(enu_heading), math.cos(enu_heading))
-
-            std_msg.pose.pose.orientation.w = math.cos(enu_heading / 2.0)
-            std_msg.pose.pose.orientation.x = 0.0
-            std_msg.pose.pose.orientation.y = 0.0
-            std_msg.pose.pose.orientation.z = math.sin(enu_heading / 2.0)
-
-            # Broadcast ODOM -> BASE_LINK
-            t_base = TransformStamped()
-            t_base.header.stamp = std_msg.header.stamp
-            t_base.header.frame_id = std_msg.header.frame_id
-            t_base.child_frame_id = std_msg.child_frame_id
-            t_base.transform.translation.x = std_msg.pose.pose.position.x
-            t_base.transform.translation.y = std_msg.pose.pose.position.y
-            t_base.transform.translation.z = std_msg.pose.pose.position.z
-            t_base.transform.rotation = std_msg.pose.pose.orientation
-            self.tf_broadcaster.sendTransform(t_base)
-
-            # Broadcast MAP -> ODOM
-            if self.datum_is_set:
-                t_map = TransformStamped()
-                t_map.header.stamp = std_msg.header.stamp
-                t_map.header.frame_id = f"{self.robot_name}/map"
-                t_map.child_frame_id = std_msg.header.frame_id
-                t_map.transform.translation.x = float(self.odom_offset_x)
-                t_map.transform.translation.y = float(self.odom_offset_y)
-                t_map.transform.translation.z = 0.0
-                t_map.transform.rotation.w = 1.0
-                t_map.transform.rotation.x = 0.0
-                t_map.transform.rotation.y = 0.0
-                t_map.transform.rotation.z = 0.0
-                self.tf_broadcaster.sendTransform(t_map)
+    def _odom_callback(self, msg: Odometry):
+        std_msg = msg
 
         self.latest_odom = std_msg
         self.odom_pub.publish(std_msg)
 
-        # ==========================================
-        # PURE MAP FRAME ODOMETRY
-        # ==========================================
-        try:
-            # Convert Position from Odom to global Map
-            map_point = self.floatsam.convert_point_frame_to_frame(
-                std_msg.pose.pose.position.x, 
-                std_msg.pose.pose.position.y, 
-                std_msg.pose.pose.position.z,
-                source_frame=std_msg.header.frame_id,
-                target_frame="map"  # Global map frame, shared across all robots
+
+        target_frame = self.floatsam.LOCAL_MAP_FRAME
+        if self.tf_buffer.can_transform(target_frame, std_msg.header.frame_id, Time()):
+            try:
+                # Convert Position from Odom to global Map
+                map_point = self.floatsam.convert_point_frame_to_frame(
+                    std_msg.pose.pose.position.x,
+                    std_msg.pose.pose.position.y,
+                    std_msg.pose.pose.position.z,
+                    source_frame=std_msg.header.frame_id,
+                    target_frame=target_frame  
+                )
+
+                # Convert Velocity from Odom to global Map
+                map_twist = self.floatsam.convert_twist_frame_to_frame(
+                    std_msg.twist.twist,
+                    source_frame=std_msg.header.frame_id,
+                    target_frame=target_frame  
+                )
+
+                # Build  Odometry in global map frame
+                odom_in_map = Odometry()
+                odom_in_map.header.stamp = std_msg.header.stamp
+                odom_in_map.header.frame_id = target_frame  
+                odom_in_map.child_frame_id = ""  
+
+                # Position in map frame
+                odom_in_map.pose.pose.position = map_point.point
+                odom_in_map.pose.pose.orientation.w = 1.0  # map is fixed
+                odom_in_map.pose.pose.orientation.x = 0.0
+                odom_in_map.pose.pose.orientation.y = 0.0
+                odom_in_map.pose.pose.orientation.z = 0.0
+
+                # Velocity in map frame
+                odom_in_map.twist.twist = map_twist
+
+                self.odom_in_map_pub.publish(odom_in_map)
+
+            except Exception as e:
+                self.get_logger().debug(f'Could not compute odom_in_map: {e}')
+        else:
+            self.get_logger().warn(
+                f'Waiting for "{target_frame}" frame to exist in TF tree — odom_in_map will not be published until then.',
+                throttle_duration_sec=5.0
             )
-            
-            # Convert Velocity from Odom to global Map
-            map_twist = self.floatsam.convert_twist_frame_to_frame(
-                std_msg.twist.twist,
-                source_frame=std_msg.header.frame_id,
-                target_frame="map"  # Global map frame, shared across all robots
-            )
-            
-            # Build unified Odometry in global map frame
-            odom_in_map = Odometry()
-            odom_in_map.header.stamp = std_msg.header.stamp
-            odom_in_map.header.frame_id = "map"  # Global map frame, not robot-specific
-            odom_in_map.child_frame_id = ""  # No child frame needed—everything is in map
-            
-            # Position in map frame
-            odom_in_map.pose.pose.position = map_point.point
-            odom_in_map.pose.pose.orientation.w = 1.0  # Identity rotation (map is fixed)
-            odom_in_map.pose.pose.orientation.x = 0.0
-            odom_in_map.pose.pose.orientation.y = 0.0
-            odom_in_map.pose.pose.orientation.z = 0.0
-            
-            # Velocity in map frame
-            odom_in_map.twist.twist = map_twist
-            
-            self.odom_in_map_pub.publish(odom_in_map)
-            
-            # Publish to MQTT broker
-            self._publish_odom_to_mqtt(odom_in_map)
-            
-        except Exception as e:
-            self.get_logger().debug(f'Could not compute odom_in_map (TF tree not ready): {e}')
 
         self._compute_and_publish_derived_odom(std_msg)
 
-    
     def _compute_and_publish_derived_odom(self, std_msg: Odometry):
         orientation_list = [
             std_msg.pose.pose.orientation.x,
@@ -982,10 +329,9 @@ class SmarcTopicsPublisher(Node):
         if heading_deg < 0:
             heading_deg += 360.0
 
-        if not self.is_receiving_rtk_heading:
-            heading_msg = Float32()
-            heading_msg.data = 90.0 - heading_deg
-            self.heading_pub.publish(heading_msg)
+        heading_msg = Float32()
+        heading_msg.data = 90.0 - heading_deg
+        self.heading_pub.publish(heading_msg)
 
         vx = std_msg.twist.twist.linear.x
         vy = std_msg.twist.twist.linear.y
@@ -1004,7 +350,7 @@ class SmarcTopicsPublisher(Node):
 
     def _battery_callback(self, msg):
         std_msg = Float32()
-        std_msg.data = msg.data if self.use_sim else float(msg.remaining * 100.0)
+        std_msg.data = msg.data
         self.battery_pub.publish(std_msg)
 
 

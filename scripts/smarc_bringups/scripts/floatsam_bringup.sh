@@ -96,8 +96,8 @@ tmux send-keys "sleep 5 && ros2 launch floatsam_go_to_formation_rvo floatsam_go_
 
 # --- Go_in_formation ---
 tmux new-window -t "$SESSION:7" -n "go_in_formation"
-tmux select-window -t "$SESSION:7"
-tmux send-keys "sleep 4 && ros2 launch floatsam_go_in_formation floatsam_go_in_formation.launch.py robot_name:=$ROBOT_NAME use_sim:=$SIM_TRUE num_robots:=$NUM_ROBOTS" C-m
+#tmux select-window -t "$SESSION:7"
+#tmux send-keys "sleep 4 && ros2 launch floatsam_go_in_formation floatsam_go_in_formation.launch.py robot_name:=$ROBOT_NAME use_sim:=$SIM_TRUE num_robots:=$NUM_ROBOTS" C-m
 
 # --- Behavior tree ---
 tmux new-window -t "$SESSION:8" -n "bt"
@@ -106,12 +106,12 @@ tmux send-keys "ros2 launch wasp_bt wasp_bt.launch robot_name:=$ROBOT_NAME agent
 
 # --- GPS ---
 tmux new-window -t "$SESSION:9" -n "gps"
-tmux select-window -t "$SESSION:9"
-tmux split-window -h -t "$SESSION:9.0"
-tmux select-pane -t "$SESSION:9.0"
-tmux send-keys "ros2 launch septentrio_gnss_driver rover.launch.py ns:=$ROBOT_NAME" C-m
-tmux select-pane -t "$SESSION:9.1"
-tmux send-keys "str2str -in ntrip://cinnmon@gmail.com:none@rtk2go.com:2101/Tranholmen -out serial://ttyACM1:115200" C-m
+#tmux select-window -t "$SESSION:9"
+#tmux split-window -h -t "$SESSION:9.0"
+#tmux select-pane -t "$SESSION:9.0"
+#tmux send-keys "ros2 launch septentrio_gnss_driver rover.launch.py ns:=$ROBOT_NAME" C-m
+#tmux select-pane -t "$SESSION:9.1"
+#tmux send-keys "str2str -in ntrip://cinnmon@gmail.com:none@rtk2go.com:2101/Tranholmen -out serial://ttyACM1:115200" C-m
 
 # --- Logging ---
 tmux new-window -t "$SESSION:10" -n "logging"
